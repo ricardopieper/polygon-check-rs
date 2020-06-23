@@ -1,0 +1,730 @@
+use shapefile;
+use shapefile::record::polygon::PolygonRing;
+use shapefile::record::Shape;
+
+use glutin_window::GlutinWindow as Window;
+use opengl_graphics::{GlGraphics, OpenGL};
+use piston::event_loop::{EventSettings, Events};
+use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
+use piston::window::WindowSettings;
+
+use rand::Rng;
+use std::iter::Iterator;
+use std::time::Instant;
+
+const WINDOW_WIDTH: u32 = 800;
+const WINDOW_HEIGHT: u32 = 800;
+
+
+fn min<T>(ls: T) -> f64
+where
+    T: Iterator<Item = f64>,
+{
+    ls.fold(f64::MAX, |a, b| a.min(b))
+}
+
+fn max<T>(ls: T) -> f64
+where
+    T: Iterator<Item = f64>,
+{
+    ls.fold(f64::MIN, |a, b| a.max(b))
+}
+
+struct Slab<T> {
+    y_start: f64,
+    y_end: f64,
+    items: Vec<T>,
+}
+
+struct Vertex {
+    x: f64,
+    y: f64,
+}
+impl Vertex {
+    fn size(&self) -> f64 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+    fn versor(&self) -> Vertex {
+        Vertex {
+            x: self.x / self.size(),
+            y: self.y / self.size(),
+        }
+    }
+    fn subtract(p: &Vertex, q: &Vertex) -> Vertex {
+        Vertex {
+            x: p.x - q.x,
+            y: p.y - q.y,
+        }
+    }
+    fn cross_product(p: &Vertex, q: &Vertex) -> f64 {
+        (p.x * q.y) - (q.x * p.y)
+    }
+}
+
+struct Polygon {
+    vertices: Vec<Vertex>,
+    convex_hull: Vec<Vertex>,
+    line_color: [f32; 4],
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    slabs: Vec<Slab<Vertex>>,
+}
+
+impl Polygon {
+    fn new(vertices: Vec<Vertex>, line_color: [f32; 4]) -> Polygon {
+        let hull = Polygon::convex_hull(&vertices);
+        Polygon {
+            convex_hull: hull,
+            line_color: line_color,
+            min_x: min(vertices.iter().map(|v| v.x)),
+            max_x: max(vertices.iter().map(|v| v.x)),
+            min_y: min(vertices.iter().map(|v| v.y)),
+            max_y: max(vertices.iter().map(|v| v.y)),
+            vertices: vertices,
+            slabs: vec![],
+        }
+    }
+
+    fn convex_hull(vertices: &Vec<Vertex>) -> Vec<Vertex> {
+        let mut sorted: Vec<&Vertex> = vertices.iter().collect();
+        sorted.sort_unstable_by(|a, b| {
+            (*a).x
+                .partial_cmp(&(*b).x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut hull: Vec<Vertex> = vec![];
+
+        //all_x.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let leftmost = &sorted[0];
+
+        let mut current = &sorted[0];
+        let mut next = &sorted[1];
+
+        hull.push(Vertex {
+            x: leftmost.x,
+            y: leftmost.y,
+        });
+
+        let mut x = 0;
+        loop {
+            for vertex in sorted.iter() {
+                let v0 = vector(current, next);
+                let v1 = vector(current, vertex);
+                let cross = cross_product(&v0, &v1);
+                if cross > 0.0 {
+                    next = vertex;
+                }
+            }
+
+            if next.x == leftmost.x && next.y == leftmost.y {
+                break;
+            }
+
+            hull.push(Vertex {
+                x: next.x,
+                y: next.y,
+            });
+            current = next;
+            next = leftmost;
+
+            x = x + 1;
+        }
+
+        hull
+    }
+
+    fn update_slabs(&mut self, slab_size: f64) {
+        let mut slabs = vec![];
+
+        for y in (((self.min_y + slab_size) as u32)..=((self.max_y + slab_size) as u32)).step_by(slab_size as usize) {
+            let slab_start = y as f64 - slab_size;
+            let slab_end = y as f64;
+
+            let slab = Slab::<Vertex> {
+                y_start: slab_start,
+                y_end: slab_end,
+                items: vec![],
+            };
+            slabs.push(slab);
+        }
+
+        for vertex in self.vertices.iter() {
+            //given y position, which slab does it belong to?
+            //can probably be computed with a formula but i'm lazy
+            for slab in slabs.iter_mut() {
+                let is_inside_slab = vertex.y >= slab.y_start && vertex.y <= slab.y_end;
+
+                if is_inside_slab {
+                    slab.items.push(Vertex {
+                        x: vertex.x,
+                        y: vertex.y,
+                    });
+                }
+            }
+        }
+
+        self.slabs = slabs;
+    }
+}
+
+#[derive(Debug)]
+struct Point {
+    x: f64,
+    y: f64,
+    member_of: i32,
+}
+
+
+fn domain_transform(
+    value: f64,
+    source_min: f64,
+    source_max: f64,
+    target_min: f64,
+    target_max: f64,
+) -> f64 {
+    let source_range = source_max - source_min;
+    let target_range = target_max - target_min;
+
+    let offset_in_source = value - source_min;
+
+    target_min + ((offset_in_source / source_range) * target_range)
+}
+
+fn rescale(
+    raw_points: Vec<Vertex>,
+    x_range_start: f64,
+    x_range_end: f64,
+    y_range_start: f64,
+    y_range_end: f64,
+) -> Vec<Vertex> {
+    let mut all_x: Vec<f64> = raw_points.iter().map(|x| x.x).collect();
+    all_x.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut all_y: Vec<f64> = raw_points.iter().map(|x| x.y).collect();
+    all_y.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let min_x = all_x[0];
+    let min_y = all_y[0];
+    let max_x = *all_x.last().unwrap();
+    let max_y = *all_y.last().unwrap();
+
+    raw_points
+        .iter()
+        .map(|x: &Vertex| Vertex {
+            x: domain_transform(x.x, min_x, max_x, x_range_start, x_range_end),
+            y: domain_transform(x.y, min_y, max_y, y_range_start, y_range_end),
+        })
+        .collect()
+}
+
+fn vector(p: &Vertex, q: &Vertex) -> Vertex {
+    Vertex {
+        x: q.x - p.x,
+        y: q.y - p.y,
+    }
+}
+
+fn cross_product(p: &Vertex, q: &Vertex) -> f64 {
+    (p.x * q.y) - (q.x * p.y)
+}
+
+fn has_intersection(k: &Vertex, l: &Vertex, m: &Vertex, n: &Vertex) -> bool {
+    //bounding box check
+    {
+        let minx_kl = k.x.min(l.x);
+        let maxx_kl = k.x.max(l.x);
+
+        let minx_mn = m.x.min(n.x);
+        let maxx_mn = m.x.max(n.x);
+
+        if (minx_mn < minx_kl && maxx_mn < minx_kl) || (minx_mn > maxx_kl && maxx_mn > maxx_kl) {
+            return false;
+        }
+    }
+
+    {
+        let miny_kl = k.y.min(l.y);
+        let maxy_kl = k.y.max(l.y);
+
+        let miny_mn = m.y.min(n.y);
+        let maxy_mn = m.y.max(n.y);
+
+        if (miny_mn < miny_kl && maxy_mn < miny_kl) || (miny_mn > maxy_kl && maxy_mn > maxy_kl) {
+            return false;
+        }
+    } 
+
+    let det = (n.x - m.x) * (l.y - k.y) - (n.y - m.y) * (l.x - k.x);
+    if det == 0.0 {
+        false
+    } else {
+        let s = ((n.x - m.x) * (m.y - k.y) - (n.y - m.y) * (m.x - k.x)) / det;
+        let t = ((l.x - k.x) * (m.y - k.y) - (l.y - k.y) * (m.x - k.x)) / det;
+        s >= 0.0 && s <= 1.0 && t >= 0.0 && t <= 1.0
+    }
+}
+
+struct App {
+    gl: GlGraphics, // OpenGL drawing backend.
+    polygon: Vec<Polygon>,
+    points: Vec<Point>,
+}
+
+impl App {
+    fn new(gl: GlGraphics, polygons: Vec<Polygon>) -> Self {
+        // let mut rng = rand::thread_rng();
+
+        let width = WINDOW_WIDTH as f64;
+        let height = WINDOW_HEIGHT as f64;
+
+        let mut points = vec![];
+
+        let number_of_points = (width * height) as i32;
+
+        for x in 0..WINDOW_WIDTH {
+            for y in 0..WINDOW_HEIGHT {
+                points.push(Point {
+                    x: x as f64,
+                    y: y as f64,
+                    member_of: -1,
+                });
+            }
+        }
+        let polygons = App::build_polygons(polygons);
+
+        let mut slabs = vec![];
+        let slab_size = 25.0;
+
+        for y in (slab_size as u32..=WINDOW_HEIGHT).step_by(slab_size as usize) {
+            let slab_start = y as f64 - slab_size;
+            let slab_end = y as f64;
+
+            let mut slab = Slab {
+                y_start: slab_start,
+                y_end: slab_end,
+                items: vec![],
+            };
+
+            let mut index = 0;
+            for polygon in polygons.iter() {
+                //prove that polygon is outside the slab. If proven, then polygon is not in that slab
+                let is_outside_slab = (polygon.min_y < slab_start && polygon.max_y < slab_start)
+                    || (polygon.min_y > slab_end && polygon.max_y > slab_end);
+
+                if !is_outside_slab {
+                    slab.items.push(index);
+                }
+
+                index += 1;
+            }
+            slabs.push(slab);
+        }
+
+        {
+            let start = Instant::now();
+            App::inclusion_in_concave(&polygons, &mut points);
+            let finish = start.elapsed();
+            let throughput = number_of_points as f32 / finish.as_secs_f32();
+            println!(
+                "Concave: Finished = {:?}, throughput = {} points/sec",
+                finish, throughput
+            );
+        }
+
+        {
+            let start = Instant::now();
+            App::inclusion_in_concave_slabs(&polygons, &slabs, &mut points);
+            let finish = start.elapsed();
+            let throughput = number_of_points as f32 / finish.as_secs_f32();
+            println!(
+                "Concave + Polygon Slabs: Finished = {:?}, throughput = {} points/sec",
+                finish, throughput
+            );
+        }
+
+        {
+            let start = Instant::now();
+            App::inclusion_in_convex_hull(&polygons, &mut points);
+            let finish = start.elapsed();
+            let throughput = number_of_points as f32 / finish.as_secs_f32();
+            println!(
+                "Convex Hull: Finished = {:?}, throughput = {} points/sec",
+                finish, throughput
+            );
+        }
+        {
+            let start = Instant::now();
+            App::inclusion_in_bbox(&polygons, &mut points);
+            let finish = start.elapsed();
+            let throughput = number_of_points as f32 / finish.as_secs_f32();
+            println!(
+                "Bounding Box: Finished = {:?}, throughput = {} points/sec",
+                finish, throughput
+            );
+        }
+
+        {
+            let start = Instant::now();
+            App::inclusion_in_conv_hull_bbox(&polygons, &mut points);
+            let finish = start.elapsed();
+            let throughput = number_of_points as f32 / finish.as_secs_f32();
+            println!(
+                "Bounding Box + Convex Hull: Finished = {:?}, throughput = {} points/sec",
+                finish, throughput
+            );
+        }
+
+
+        Self {
+            gl: gl,
+            polygon: polygons,
+            points: points
+        }
+    }
+
+    fn check_inclusion_concave(polygon: &Polygon, point: &Point) -> bool {
+        let start = Vertex { x: 0.0, y: point.y };
+        let finish = Vertex {
+            x: point.x,
+            y: point.y,
+        };
+        let mut intersections = 0;
+
+        for pair in polygon.vertices.windows(2) {
+            let point1 = &pair[0];
+            let point2 = &pair[1];
+            if has_intersection(point1, point2, &start, &finish) {
+                intersections += 1;
+            }
+        }
+
+        return intersections % 2 != 0;
+    }
+
+ 
+    fn check_inclusion_convex(polygon: &Vec<Vertex>, point: &Point) -> bool {
+        let mut last_side = -1;
+        let target = Vertex {
+            x: point.x,
+            y: point.y,
+        };
+
+        for window in polygon.windows(2) {
+            let my_position = &window[0];
+            let looking_at = &window[1];
+
+            let a = Vertex::subtract(looking_at, my_position).versor();
+            let b = Vertex::subtract(&target, my_position).versor();
+
+            let cross = Vertex::cross_product(&a, &b);
+
+            let side = if cross > 0.0 { 1 } else { 0 };
+
+            if last_side == -1 {
+                last_side = side;
+            } else {
+                if side != last_side {
+                    return false;
+                }
+                last_side = side;
+            }
+        }
+        return true;
+    }
+
+    fn check_inclusion_bbox(polygon: &Polygon, point: &Point) -> bool {
+        return point.x >= polygon.min_x
+            && point.x <= polygon.max_x
+            && point.y >= polygon.min_y
+            && point.y <= polygon.max_y;
+    }
+
+    fn inclusion_in_concave_slabs(
+        polygons: &Vec<Polygon>,
+        slabs: &Vec<Slab<usize>>,
+        points: &mut Vec<Point>) {
+        for point in points {
+            point.member_of = -1;
+
+            //which slab does this point belong to?
+
+            let slab_opt = slabs
+                .iter()
+                .find(|s| point.y >= (*s).y_start && point.y <= (*s).y_end);
+            let slab = slab_opt.unwrap();
+
+            //which polygons are part of this slab?
+
+            let polygons_in_slab = slab.items.iter().map(|index| &polygons[*index as usize]);
+            let mut poly_index = 0;
+
+            for polygon in polygons_in_slab {
+                let is_in_polygon = App::check_inclusion_concave(polygon, &point);
+                if is_in_polygon {
+                    point.member_of = poly_index;
+                }
+                poly_index += 1;
+            }
+        }
+    }
+
+   
+
+    fn inclusion_in_concave(polygons: &Vec<Polygon>, points: &mut Vec<Point>) {
+        for point in points {
+            point.member_of = -1;
+            let mut poly_index = 0;
+            for polygon in polygons {
+                let is_in_polygon = App::check_inclusion_concave(polygon, &point);
+                if is_in_polygon {
+                    point.member_of = poly_index;
+                }
+                poly_index += 1;
+            }
+        }
+    }
+
+    fn inclusion_in_convex_hull(polygons: &Vec<Polygon>, points: &mut Vec<Point>) {
+        for point in points {
+            point.member_of = -1;
+            let mut poly_index = 0;
+            for polygon in polygons {
+                if !App::check_inclusion_convex(&polygon.convex_hull, &point) {
+                    continue;
+                }
+
+                let is_in_polygon = App::check_inclusion_concave(polygon, &point);
+                if is_in_polygon {
+                    point.member_of = poly_index;
+                }
+                poly_index += 1;
+            }
+        }
+    }
+
+    fn inclusion_in_bbox(polygons: &Vec<Polygon>, points: &mut Vec<Point>) {
+        for point in points {
+            point.member_of = -1;
+            let mut poly_index = 0;
+            for polygon in polygons {
+                if !App::check_inclusion_bbox(&polygon, &point) {
+                    continue;
+                }
+
+                let is_in_polygon = App::check_inclusion_concave(polygon, &point);
+                if is_in_polygon {
+                    point.member_of = poly_index;
+                }
+                poly_index += 1;
+            }
+        }
+    }
+
+    fn inclusion_in_conv_hull_bbox(polygons: &Vec<Polygon>, points: &mut Vec<Point>) {
+        for point in points {
+            point.member_of = -1;
+            let mut poly_index = 0;
+            for polygon in polygons {
+                if !App::check_inclusion_bbox(&polygon, &point) {
+                    continue;
+                }
+
+                if !App::check_inclusion_convex(&polygon.convex_hull, &point) {
+                    continue;
+                }
+
+                let is_in_polygon = App::check_inclusion_concave(polygon, &point);
+                if is_in_polygon {
+                    point.member_of = poly_index;
+                }
+                poly_index += 1;
+            }
+        }
+    }
+
+
+    fn build_polygons(polygons: Vec<Polygon>) -> Vec<Polygon> {
+        let divider = 3.0;
+        let mut i = 0.0;
+        let count = polygons.len() as f64;
+        let strip_length = count / divider;
+
+        let width = WINDOW_WIDTH as f64 / strip_length;
+        let height = WINDOW_HEIGHT as f64 / strip_length;
+
+        //This code lays our the polygons in 3 diagonal strips
+        polygons
+            .into_iter()
+            .map(|polygon| {
+                let start_height = ((i % strip_length) * height) / divider //This line lays the polygons in a diagonal in 3 strips
+                                    + ((i / strip_length) * (height + height*0.1)); //and this one puts the strips one below the other
+                let start_width = (i % strip_length) * width;
+
+                let rescaled = rescale(
+                    polygon.vertices,
+                    start_width,
+                    start_width + width,
+                    start_height + height,
+                    start_height,
+                );
+
+                let mut new_poly = Polygon::new(rescaled, polygon.line_color);
+                i = i + 1.0;
+
+                new_poly.update_slabs(16.0);
+
+                return new_poly;
+            })
+            .collect()
+    }
+
+    fn render(&mut self, args: &RenderArgs) {
+        use graphics::*;
+
+        const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+        let polygons = &self.polygon;
+        let points = &self.points;
+
+        self.gl.draw(args.viewport(), |c, gl| {
+            // Clear the screen.
+            clear(BLACK, gl);
+
+            for point in points.iter() {
+                let radius = ellipse::circle(point.x, point.y, 1.0);
+                let color = if point.member_of == -1 {
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    [1.0, 0.0, 0.0, 1.0]
+                };
+
+                ellipse(color, radius, c.transform, gl);
+            }
+
+            for polygon in polygons.iter() {
+                let mut last_vertex: Option<&Vertex> = None;
+                for vertex in polygon.vertices.iter() {
+                    if let Some(last_vtx) = last_vertex {
+                        line(
+                            polygon.line_color,
+                            1.0,
+                            [last_vtx.x, last_vtx.y, vertex.x, vertex.y],
+                            c.transform,
+                            gl,
+                        );
+                    }
+
+                    last_vertex = Some(vertex);
+                }
+
+                last_vertex = None;
+                for vertex in polygon.convex_hull.iter() {
+                    if let Some(last_vtx) = last_vertex {
+                        line(
+                            [1.0, 1.0, 0.0, 1.0],
+                            0.5,
+                            [last_vtx.x, last_vtx.y, vertex.x, vertex.y],
+                            c.transform,
+                            gl,
+                        );
+                    }
+
+                    last_vertex = Some(vertex);
+                }
+            }
+
+          /*  line(
+                [0.0, 1.0, 0.0, 1.0],
+                1.0,
+                [0.0, 15.0, 800.0, 15.0],
+                c.transform,
+                gl,
+            );*/
+
+        });
+    }
+
+    fn update(&mut self, _args: &UpdateArgs) {
+        // Rotate 2 radians per second.
+    }
+}
+
+fn get_polygon() -> Vec<Vertex> {
+    let mut polygons = vec![];
+    let reader =
+        shapefile::Reader::from_path("/home/ricardo/cg4/data/dados_geo/estado_rs.shp").unwrap();
+    for shape in reader {
+        let shape = shape.unwrap();
+
+        if let Shape::Polygon(ref polygon) = shape {
+            for ring in polygon.rings() {
+                let points = match ring {
+                    PolygonRing::Outer(ref points) => points,
+                    PolygonRing::Inner(points) => points,
+                };
+
+                for point in points {
+                    polygons.push(Vertex {
+                        x: point.x,
+                        y: point.y,
+                    })
+                }
+            }
+        } else {
+            println!("Shapetype is {}", shape.shapetype());
+            println!("{}", shape);
+        }
+    }
+    polygons
+}
+
+fn main() {
+    // Change this to OpenGL::V2_1 if not working.
+    let opengl = OpenGL::V3_2;
+
+    // Create an Glutin window.
+    let mut window: Window = WindowSettings::new("RS MAP", [WINDOW_WIDTH, WINDOW_HEIGHT])
+        .graphics_api(opengl)
+        .exit_on_esc(true)
+        .samples(4)
+        .build()
+        .unwrap();
+
+    // Create a new game and run it.
+    let mut app = App::new(
+        GlGraphics::new(opengl),
+        vec![
+            Polygon::new(get_polygon(), [1.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 0.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 1.0, 0.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 0.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 1.0, 0.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 0.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [0.0, 1.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 0.0, 1.0, 1.0]),
+            Polygon::new(get_polygon(), [1.0, 1.0, 0.0, 1.0]),
+        ],
+    );
+
+    let mut events = Events::new(EventSettings::new());
+    while let Some(e) = events.next(&mut window) {
+        if let Some(args) = e.render_args() {
+            app.render(&args);
+        }
+
+        if let Some(args) = e.update_args() {
+            app.update(&args);
+        }
+    }
+}
